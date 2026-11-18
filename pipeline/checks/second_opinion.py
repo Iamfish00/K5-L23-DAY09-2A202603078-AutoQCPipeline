@@ -35,10 +35,74 @@ Gợi ý
 - `iou_xywh` có sẵn. Dòng nhãn hỏng không được làm script chết (dùng `ds.valid_boxes` và `parse_yolo_line` trong try).
 - Kết quả phụ thuộc mạnh vào ngưỡng: calibrate chúng ở Bước 3 thay vì đoán.
 """
-from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
-from ..model_cache import get_preds  # noqa: F401
+from ..common import WARN, Issue, iou_xywh, parse_yolo_line
+from ..model_cache import get_preds
+
+
+def _prediction_warning(stem, class_id, confidence, box, labels, rules):
+    overlaps = [(iou_xywh(box, label_box), label_class) for _, label_class, label_box in labels]
+    candidates = [(iou, label_class) for iou, label_class in overlaps if iou >= rules["iou_missing"]]
+    extra = {"conf": confidence}
+    if not candidates:
+        return Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                     f"model thấy vật lớp {class_id} nhưng chưa có box nhãn khớp", extra=extra)
+
+    best_same = max((iou for iou, label_class in candidates if label_class == class_id), default=None)
+    if best_same is not None:
+        if best_same < rules["iou_loose"]:
+            return Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                         "box nhãn và dự đoán cùng lớp nhưng lệch nhau", extra={**extra, "iou": best_same})
+        return None
+
+    best_iou, label_class = max(candidates)
+    if best_iou >= rules["iou_match"]:
+        return Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                     f"nhãn lớp {label_class}, model dự đoán lớp {class_id}", extra={**extra, "iou": best_iou})
+    return None
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    rules = cfg["second_opinion"]
+    issues = []
+    for path in ds.image_files():
+        stem = path.stem
+        if stem not in preds:
+            continue
+        lines = ds.read_label_lines(stem)
+        if lines is None:
+            continue
+
+        labels = []
+        for line, text in lines:
+            try:
+                class_id, *box = parse_yolo_line(text)
+            except (ValueError, OverflowError):
+                continue
+            if 0 <= class_id < len(ds.classes):
+                labels.append((line, class_id, box))
+
+        predictions = preds[stem]
+        size = ds.image_size(stem)
+        if size is not None:
+            image_width, image_height = size
+            for class_id, confidence, *box in predictions:
+                if confidence < rules["conf"]:
+                    continue
+                area = (box[2] * image_width) * (box[3] * image_height)
+                if area < rules["min_area_px"]:
+                    continue
+                warning = _prediction_warning(stem, class_id, confidence, box, labels, rules)
+                if warning is not None:
+                    issues.append(warning)
+
+        fp_boxes = [box for _, confidence, *box in predictions if confidence >= rules["fp_conf"]]
+        for line, _, label_box in labels:
+            best_iou = max((iou_xywh(label_box, box) for box in fp_boxes), default=None)
+            if best_iou is None or best_iou < rules["iou_missing"]:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                                    "box nhãn không khớp vật nào model thấy", line,
+                                    extra={"iou": best_iou if best_iou is not None else 0.0}))
+    return issues
